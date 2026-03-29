@@ -23,32 +23,39 @@ LANG_TO_EXPERT = {
 # -------------------------------
 # Collate function for batching
 # -------------------------------
-def collate_batch(samples, device="cpu"):
+def collate_batch(samples, embedding_cache, device="cpu"):
+    """
+    Prepares a batch for EyeExpertM using a shared embeddings cache.
+    - samples: list of dataset dicts (no embeddings inside)
+    - embedding_cache: dict {sentence: tensor[num_words, hidden_dim]}
+    """
     batch_inputs, fix_inputs, fix_targets, dur_targets = [], [], [], []
     lengths, full_word_embeddings, expert_ids = [], [], []
 
     for sample in samples:
-        word_embeddings = sample["word_embeddings"]  # [num_words, dim]
-        fix_seq = sample["scanpath"]                 # list of ints (0-based)
-        dur_seq = sample["durations"]
+        # Fetch embeddings from the cache
+        word_embeddings = embedding_cache[sample["sentence"]].to(device)  # [num_words, hidden_dim]
+        fix_seq = torch.tensor(sample["scanpath"], dtype=torch.long, device=device)
+        dur_seq = torch.tensor(sample["durations"], dtype=torch.float, device=device)
         lang = sample["lang"].lower().strip()
 
         if len(fix_seq) <= 1:
             continue
 
-        fix_seq = torch.tensor(fix_seq, dtype=torch.long)
-        fix_input = fix_seq[:-1] + 1   # shift for embedding
+        # Shift for RNN input/target
+        fix_input = fix_seq[:-1] + 1
         fix_target = fix_seq[1:] + 1
-        dur_target = torch.tensor(dur_seq[1:], dtype=torch.float)
+        dur_target = dur_seq[1:]
 
+        # Mask invalid indices
         num_words = word_embeddings.size(0) + 1
-
         mask = (fix_input > 0) & (fix_input < num_words)
         fix_input, fix_target, dur_target = fix_input[mask], fix_target[mask], dur_target[mask]
 
         if len(fix_input) == 0:
             continue
 
+        # Gather embeddings for fixated words
         batch_inputs.append(word_embeddings[fix_input - 1])
         fix_inputs.append(fix_input)
         fix_targets.append(fix_target)
@@ -60,7 +67,7 @@ def collate_batch(samples, device="cpu"):
     if not batch_inputs:
         return None
 
-    # Padding
+    # Padding sequences
     padded_inputs = pad_sequence(batch_inputs, batch_first=True)
     padded_fix_inputs = pad_sequence(fix_inputs, batch_first=True, padding_value=PAD_IDX)
     padded_fix_targets = pad_sequence(fix_targets, batch_first=True, padding_value=-1)
@@ -151,7 +158,7 @@ class EyeExpertM(nn.Module):
         for mask, out in outputs_all:
             outputs[mask] = out
 
-        # Attention
+        # Attention over full sentence
         proj = self.output_layer(outputs)
         logits = torch.matmul(proj, full_word_embeddings.transpose(1, 2))
 
@@ -166,9 +173,7 @@ class EyeExpertM(nn.Module):
         word_mask = (full_word_embeddings.abs().sum(-1) != 0)
         logits = logits.masked_fill(~word_mask.unsqueeze(1), -1e9)
 
-        # Duration
-        dur_pred = self.duration_layer(outputs)
-        if dur_pred.size(-1) == 1:
-            dur_pred = dur_pred.squeeze(-1)
+        # Duration prediction
+        dur_pred = self.duration_layer(outputs).squeeze(-1)
 
         return logits, dur_pred

@@ -1,9 +1,12 @@
+import os
+
 import pandas as pd
 import numpy as np
 import pyreadr
 from pathlib import Path
 from rapidfuzz import process, fuzz
 import pickle
+from transformers import XLMRobertaModel, XLMRobertaTokenizer
 
 class MECOPipeline:
     def __init__(

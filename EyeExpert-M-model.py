@@ -1,174 +1,90 @@
-from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 import torch
-import torch.nn as nn
+import pickle
+import os
+import string
+from transformers import XLMRobertaModel, XLMRobertaTokenizer
 
-PAD_IDX = 0
+tokenizer = XLMRobertaTokenizer.from_pretrained("xlm-roberta-base")
+encoder = XLMRobertaModel.from_pretrained("xlm-roberta-base")
+encoder.eval()
+for param in encoder.parameters():
+    param.requires_grad = False
 
-# -------------------------------
-# Language → Expert mapping
-# -------------------------------
-LANG_TO_EXPERT = {
-    # Expert 0 — Germanic
-    "en": 0, "en_uk": 0, "du": 0, "ge": 0, "ge_po": 0, "ge_zu": 0,
-    # Expert 1 — Nordic
-    "no": 1, "da": 1, "ic": 1,
-    # Expert 2 — Romance
-    "sp": 2, "sp_ch": 2, "it": 2, "bp": 2,
-    # Expert 3 — Slavic
-    "ru": 3, "ru_mo": 3, "se": 3,
-    # Expert 4 — Uralic
-    "fi": 4, "ee": 4,
-}
+def add_embeddings_to_pickles_fixated_words(pickle_dir, cache_path="embedding_cache.pkl", batch_size=16, device="cpu"):
+    # Load existing cache if present
+    if os.path.exists(cache_path):
+        print(f"Loading cached embeddings from {cache_path}")
+        with open(cache_path, "rb") as f:
+            sentence_cache = pickle.load(f)
+    else:
+        sentence_cache = {}
 
-# -------------------------------
-# Collate function for batching
-# -------------------------------
-def collate_batch(samples, device="cpu"):
-    batch_inputs, fix_inputs, fix_targets, dur_targets = [], [], [], []
-    lengths, full_word_embeddings, expert_ids = [], [], []
-
-    for sample in samples:
-        word_embeddings = sample["word_embeddings"]  # [num_words, dim]
-        fix_seq = sample["scanpath"]                 # list of ints (0-based)
-        dur_seq = sample["durations"]
-        lang = sample["lang"].lower().strip()
-
-        if len(fix_seq) <= 1:
+    # Iterate over pickle files
+    for fname in os.listdir(pickle_dir):
+        if not fname.endswith(".pkl"):
             continue
 
-        fix_seq = torch.tensor(fix_seq, dtype=torch.long)
-        fix_input = fix_seq[:-1] + 1   # shift for embedding
-        fix_target = fix_seq[1:] + 1
-        dur_target = torch.tensor(dur_seq[1:], dtype=torch.float)
+        path = os.path.join(pickle_dir, fname)
+        with open(path, "rb") as f:
+            samples = pickle.load(f)
 
-        num_words = word_embeddings.size(0) + 1
+        # Identify sentences that need embeddings
+        sentences_to_compute = [s["sentence"] for s in samples if s["sentence"] not in sentence_cache]
+        sentences_to_compute = list(set(sentences_to_compute))
+        print(f"{fname}: {len(sentences_to_compute)} sentences need embeddings")
 
-        mask = (fix_input > 0) & (fix_input < num_words)
-        fix_input, fix_target, dur_target = fix_input[mask], fix_target[mask], dur_target[mask]
+        # Compute embeddings in batches
+        for start in range(0, len(sentences_to_compute), batch_size):
+            batch_sentences = sentences_to_compute[start:start+batch_size]
+            encoding = tokenizer(
+                batch_sentences,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                return_offsets_mapping=True
+            )
 
-        if len(fix_input) == 0:
-            continue
+            offsets = encoding["offset_mapping"]
+            encoding = {k: v.to(device) for k, v in encoding.items() if k != "offset_mapping"}
 
-        batch_inputs.append(word_embeddings[fix_input - 1])
-        fix_inputs.append(fix_input)
-        fix_targets.append(fix_target)
-        dur_targets.append(dur_target)
-        lengths.append(len(fix_input))
-        full_word_embeddings.append(word_embeddings)
-        expert_ids.append(LANG_TO_EXPERT.get(lang, 0))
+            with torch.no_grad():
+                outputs = encoder(**encoding)
 
-    if not batch_inputs:
-        return None
+            hidden = outputs.last_hidden_state  # [B, seq_len, hidden_dim]
 
-    # Padding
-    padded_inputs = pad_sequence(batch_inputs, batch_first=True)
-    padded_fix_inputs = pad_sequence(fix_inputs, batch_first=True, padding_value=PAD_IDX)
-    padded_fix_targets = pad_sequence(fix_targets, batch_first=True, padding_value=-1)
-    padded_durs = pad_sequence(dur_targets, batch_first=True)
-    padded_full_words = pad_sequence(full_word_embeddings, batch_first=True)
+            # Assign embeddings to fixated words
+            for i, sentence in enumerate(batch_sentences):
+                token_embeds = hidden[i]  # [seq_len, hidden_dim]
+                token_offsets = offsets[i]
+                samples_for_sentence = [s for s in samples if s["sentence"] == sentence]
 
-    return (
-        padded_inputs.to(device),
-        padded_fix_inputs.to(device),
-        padded_fix_targets.to(device),
-        padded_durs.to(device),
-        padded_full_words.to(device),
-        lengths,
-        torch.tensor(expert_ids, dtype=torch.long, device=device),
-    )
+                for sample in samples_for_sentence:
+                    word_vectors = []
+                    for word in sample["words"]:  # only fixated words
+                        word_clean = word.strip(string.punctuation).lower()
+                        subword_vectors = []
+                        for tok_i, (start_c, end_c) in enumerate(token_offsets):
+                            token_text = sentence[start_c:end_c].strip(string.punctuation).lower()
+                            if token_text == word_clean:
+                                subword_vectors.append(token_embeds[tok_i])
+                        if subword_vectors:
+                            word_vectors.append(torch.stack(subword_vectors).mean(dim=0))
+                        else:
+                            # fallback: first token embedding
+                            word_vectors.append(token_embeds[0])
+                    # Convert to tensor of shape [num_fixated_words, hidden_dim]
+                    sentence_cache[sentence] = torch.stack(word_vectors)
 
-# -------------------------------
-# EyeExpertM Model
-# -------------------------------
-class EyeExpertM(nn.Module):
-    def __init__(
-        self,
-        hidden_dim=256,
-        encoder_dim=768,
-        n_experts=5,
-        max_seq_len=200,
-        n_layers=1,
-        dropout=0.1,
-        attention_type="dot",
-        window_size=8
-    ):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.encoder_dim = encoder_dim
-        self.n_experts = n_experts
-        self.window_size = window_size
-        self.attention_type = attention_type
+        # Assign embeddings to all samples in this pickle
+        for sample in samples:
+            sample["word_embeddings"] = sentence_cache[sample["sentence"]]
 
-        # Experts
-        self.experts = nn.ModuleList([
-            nn.GRU(
-                input_size=encoder_dim + 32,
-                hidden_size=hidden_dim,
-                num_layers=n_layers,
-                dropout=dropout if n_layers > 1 else 0,
-                batch_first=True
-            ) for _ in range(n_experts)
-        ])
+        # Overwrite pickle
+        with open(path, "wb") as f:
+            pickle.dump(samples, f)
+        print(f"Updated {len(samples)} samples with embeddings in {fname}")
 
-        # Scanpath embedding
-        self.scanpath_embedding = nn.Embedding(max_seq_len + 1, 32, padding_idx=PAD_IDX)
-
-        # Output projection
-        self.output_layer = nn.Linear(hidden_dim, encoder_dim)
-
-        # Duration prediction
-        self.duration_layer = nn.Linear(hidden_dim, 1)
-
-    def forward(self, inputs, fix_inputs, full_word_embeddings, lengths, expert_ids):
-        device = inputs.device
-
-        # Scanpath embeddings
-        scanpath_embeds = self.scanpath_embedding(fix_inputs)
-        rnn_inputs = torch.cat([inputs, scanpath_embeds], dim=-1)
-
-        outputs_all = []
-
-        # Route per expert
-        for expert_id in range(self.n_experts):
-            mask = (expert_ids.to(device) == expert_id)
-            if mask.sum() == 0:
-                continue
-
-            expert = self.experts[expert_id]
-            rnn_in = rnn_inputs[mask]
-            idxs = mask.nonzero(as_tuple=True)[0].tolist()
-            lens = torch.tensor([lengths[i] for i in idxs], dtype=torch.long, device=device)
-
-            packed = pack_padded_sequence(rnn_in, lens, batch_first=True, enforce_sorted=False)
-            out, _ = expert(packed)
-            out, _ = pad_packed_sequence(out, batch_first=True, total_length=fix_inputs.size(1))
-
-            outputs_all.append((mask, out))
-
-        # Reconstruct batch
-        outputs = torch.zeros(rnn_inputs.size(0), rnn_inputs.size(1), self.hidden_dim,
-                              device=device, dtype=rnn_inputs.dtype)
-        for mask, out in outputs_all:
-            outputs[mask] = out
-
-        # Attention
-        proj = self.output_layer(outputs)
-        logits = torch.matmul(proj, full_word_embeddings.transpose(1, 2))
-
-        # Saccade mask
-        cur_fix = fix_inputs.unsqueeze(-1)
-        word_positions = torch.arange(full_word_embeddings.size(1), device=device).view(1, 1, -1)
-        distance = torch.abs(word_positions - (cur_fix - 1))
-        saccade_mask = distance <= self.window_size
-        logits = logits.masked_fill(~saccade_mask, -1e9)
-
-        # Word mask (padding)
-        word_mask = (full_word_embeddings.abs().sum(-1) != 0)
-        logits = logits.masked_fill(~word_mask.unsqueeze(1), -1e9)
-
-        # Duration
-        dur_pred = self.duration_layer(outputs)
-        if dur_pred.size(-1) == 1:
-            dur_pred = dur_pred.squeeze(-1)
-
-        return logits, dur_pred
+    # Save cache
+    with open(cache_path, "wb") as f:
+        pickle.dump(sentence_cache, f)
+    print(f"Saved embedding cache to {cache_path}")

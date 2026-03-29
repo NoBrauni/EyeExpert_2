@@ -3,3 +3,4 @@ torch~=2.11.0
 pandas~=2.2.3
 numpy~=2.2.4
 rapidfuzz~=3.12.1
+sentencepiece>=0.1.96

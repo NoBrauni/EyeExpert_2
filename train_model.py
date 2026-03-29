@@ -6,14 +6,11 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 from model_definition import *
+from embeddings import generate_universal_sentence_embeddings  # your embedding function
 
 # -------------------------------
 # Config
 # -------------------------------
-SPLIT_BY_READER = True
-ENSURE_UNSEEN_SENTENCES = True
-LEAVE_OUT_LANGUAGE = None
-
 TRAIN_RATIO = 0.7
 VAL_RATIO   = 0.15
 TEST_RATIO  = 0.15
@@ -34,7 +31,7 @@ print("Using device:", device)
 # -------------------------------
 # Load samples from pickle
 # -------------------------------
-data_dir = "data_full_sentence_fixed"
+data_dir = "datasets"
 
 all_samples = []
 for fname in os.listdir(data_dir):
@@ -45,64 +42,43 @@ for fname in os.listdir(data_dir):
 print(f"Loaded {len(all_samples)} samples.")
 
 # -------------------------------
-# Load embeddings
+# Load or generate embeddings
 # -------------------------------
-with open("all_embeddings_cache.pkl", "rb") as f:
-    embedding_cache = pickle.load(f)
+embedding_cache_path = "all_embeddings_cache.pkl"
 
-for s in all_samples:
-    s["word_embeddings"] = embedding_cache[s["sentence"]]
+if os.path.exists(embedding_cache_path):
+    print(f"Loading embeddings from {embedding_cache_path}")
+    with open(embedding_cache_path, "rb") as f:
+        embedding_cache = pickle.load(f)
+else:
+    print(f"No embeddings cache found. Computing universal embeddings...")
+    embedding_cache = generate_universal_sentence_embeddings(data_dir, cache_path=embedding_cache_path, device=device)
 
-print("Embeddings assigned.")
+print("Embeddings ready.")
 
 # -------------------------------
-# Dataset split
+# Dataset split (unseen sentence split)
 # -------------------------------
-def split_dataset(samples):
-    if LEAVE_OUT_LANGUAGE:
-        train = [s for s in samples if s["lang"] != LEAVE_OUT_LANGUAGE]
-        held = [s for s in samples if s["lang"] == LEAVE_OUT_LANGUAGE]
-        random.shuffle(held)
-        mid = len(held) // 2
-        return train, held[:mid], held[mid:]
+sentences = list({s["sentence"] for s in all_samples})
+random.shuffle(sentences)
+n = len(sentences)
+train_s = set(sentences[:int(TRAIN_RATIO*n)])
+val_s   = set(sentences[int(TRAIN_RATIO*n):int((TRAIN_RATIO+VAL_RATIO)*n)])
+test_s  = set(sentences[int((TRAIN_RATIO+VAL_RATIO)*n):])
 
-    if ENSURE_UNSEEN_SENTENCES:
-        sentences = list({s["sentence"] for s in samples})
-        random.shuffle(sentences)
-        n = len(sentences)
-        train_s = set(sentences[:int(TRAIN_RATIO*n)])
-        val_s   = set(sentences[int(TRAIN_RATIO*n):int((TRAIN_RATIO+VAL_RATIO)*n)])
-        test_s  = set(sentences[int((TRAIN_RATIO+VAL_RATIO)*n):])
-        return (
-            [s for s in samples if s["sentence"] in train_s],
-            [s for s in samples if s["sentence"] in val_s],
-            [s for s in samples if s["sentence"] in test_s],
-        )
+train_samples = [s for s in all_samples if s["sentence"] in train_s]
+val_samples   = [s for s in all_samples if s["sentence"] in val_s]
+test_samples  = [s for s in all_samples if s["sentence"] in test_s]
 
-    if SPLIT_BY_READER:
-        readers = list({s["reader"] for s in samples})
-        random.shuffle(readers)
-        n = len(readers)
-        train_r = readers[:int(TRAIN_RATIO*n)]
-        val_r   = readers[int(TRAIN_RATIO*n):int((TRAIN_RATIO+VAL_RATIO)*n)]
-        test_r  = readers[int((TRAIN_RATIO+VAL_RATIO)*n):]
-        return (
-            [s for s in samples if s["reader"] in train_r],
-            [s for s in samples if s["reader"] in val_r],
-            [s for s in samples if s["reader"] in test_r],
-        )
-
-train_samples, val_samples, test_samples = split_dataset(all_samples)
 print(f"Train: {len(train_samples)}, Val: {len(val_samples)}, Test: {len(test_samples)}")
 
 # -------------------------------
-# Curriculum
+# Curriculum logic for experts
 # -------------------------------
 expert_datasets = {}
 for s in train_samples:
-    eid = LANG_TO_EXPERT.get(s["lang"].lower())
-    if eid is not None:
-        expert_datasets.setdefault(eid, []).append(s)
+    eid = LANG_TO_EXPERT.get(s["lang"].lower(), 0)
+    expert_datasets.setdefault(eid, []).append(s)
 
 def sample_curriculum(epoch):
     target = epoch % len(expert_datasets)
@@ -116,10 +92,10 @@ def sample_curriculum(epoch):
     return data
 
 # -------------------------------
-# Safe collate wrapper
+# Collate wrapper using universal cache
 # -------------------------------
 def safe_collate(batch):
-    return collate_batch(batch, device=device)
+    return collate_batch(batch, embedding_cache, device=device)
 
 # -------------------------------
 # Training & evaluation
@@ -140,19 +116,11 @@ def train_epoch(model, samples, optimizer):
         optimizer.zero_grad()
         logits, dur_pred = model(inputs, fix_inputs, full_word_embeddings, lengths, expert_ids)
 
-        # Fixation loss
-        loss_scan = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            fix_targets.view(-1),
-            ignore_index=-1
-        )
-
-        # Duration loss
+        loss_scan = F.cross_entropy(logits.view(-1, logits.size(-1)), fix_targets.view(-1), ignore_index=-1)
         mask = fix_targets != -1
         if not mask.any():
             continue
         loss_dur = F.mse_loss(dur_pred[mask], dur_targets[mask])
-
         loss = ALPHA * loss_scan + (1 - ALPHA) * loss_dur
         loss.backward()
         optimizer.step()
@@ -177,17 +145,11 @@ def evaluate(model, samples):
             inputs, fix_inputs, fix_targets, dur_targets, full_word_embeddings, lengths, expert_ids = collated
             logits, dur_pred = model(inputs, fix_inputs, full_word_embeddings, lengths, expert_ids)
 
-            loss_scan = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                fix_targets.view(-1),
-                ignore_index=-1
-            )
-
+            loss_scan = F.cross_entropy(logits.view(-1, logits.size(-1)), fix_targets.view(-1), ignore_index=-1)
             mask = fix_targets != -1
             if not mask.any():
                 continue
             loss_dur = F.mse_loss(dur_pred[mask], dur_targets[mask])
-
             loss = ALPHA * loss_scan + (1 - ALPHA) * loss_dur
             total_loss += loss.item()
             steps += 1
