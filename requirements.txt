@@ -4,3 +4,4 @@ pandas~=2.2.3
 numpy~=2.2.4
 rapidfuzz~=3.12.1
 sentencepiece>=0.1.96
+transformers==5.1.0

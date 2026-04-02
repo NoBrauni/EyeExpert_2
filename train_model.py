@@ -1,186 +1,182 @@
+# ------------------------------- Imports -------------------------------
 import os
 import random
 import pickle
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
+from tqdm import tqdm
+from embeddings import generate_universal_sentence_embeddings, normalize_sentence
+from model_definition import EyeExpertM, collate_batch, LANG_TO_EXPERT, PAD_IDX
 
-from model_definition import *
-from embeddings import generate_universal_sentence_embeddings  # your embedding function
+# ------------------------------- Config -------------------------------
+DATA_DIR = "datasets"
+EMBEDDING_CACHE = "full_sentence_embeddings.pkl"
 
-# -------------------------------
-# Config
-# -------------------------------
 TRAIN_RATIO = 0.7
 VAL_RATIO   = 0.15
 TEST_RATIO  = 0.15
 
+LEAVE_OUT_LANGUAGE = None
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 4
+EPOCHS = 3
+ALPHA = 0.31
+
 USE_EXPERT_CURRICULUM = True
 CURRICULUM_MIX_RATIO = 0.2
 
-BATCH_SIZE = 16
-EPOCHS = 5
-ALPHA = 0.31
-
 random.seed(42)
-torch.manual_seed(42)
+os.makedirs("checkpoints", exist_ok=True)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-
-# -------------------------------
-# Load samples from pickle
-# -------------------------------
-data_dir = "datasets"
-
+# ------------------------------- Step 1: Load dataset -------------------------------
 all_samples = []
-for fname in os.listdir(data_dir):
+for fname in os.listdir(DATA_DIR):
     if fname.endswith(".pkl"):
-        with open(os.path.join(data_dir, fname), "rb") as f:
-            all_samples.extend(pickle.load(f))
-
+        with open(os.path.join(DATA_DIR, fname), "rb") as f:
+            samples = pickle.load(f)
+            all_samples.extend(samples)
+all_samples = [s for s in all_samples if s.get("sentence") is not None]
 print(f"Loaded {len(all_samples)} samples.")
 
-# -------------------------------
-# Load or generate embeddings
-# -------------------------------
-embedding_cache_path = "all_embeddings_cache.pkl"
+# ------------------------------- Step 2: Load or generate embeddings -------------------------------
+if not os.path.exists(EMBEDDING_CACHE):
+    print("No embeddings found. Generating embeddings...")
+    generate_universal_sentence_embeddings(
+        pickle_dir=DATA_DIR,
+        cache_path=EMBEDDING_CACHE,
+        batch_size=4,
+        device=DEVICE,
+        max_sentences=None
+    )
 
-if os.path.exists(embedding_cache_path):
-    print(f"Loading embeddings from {embedding_cache_path}")
-    with open(embedding_cache_path, "rb") as f:
-        embedding_cache = pickle.load(f)
-else:
-    print(f"No embeddings cache found. Computing universal embeddings...")
-    embedding_cache = generate_universal_sentence_embeddings(data_dir, cache_path=embedding_cache_path, device=device)
+with open(EMBEDDING_CACHE, "rb") as f:
+    embedding_cache = pickle.load(f)
+print(f"✅ Loaded embedding cache ({len(embedding_cache)})")
 
-print("Embeddings ready.")
+# ------------------------------- Step 3: Dataset splitting -------------------------------
+def split_dataset(samples):
+    if LEAVE_OUT_LANGUAGE:
+        train_samples = [s for s in samples if s["lang"] != LEAVE_OUT_LANGUAGE]
+        heldout = [s for s in samples if s["lang"] == LEAVE_OUT_LANGUAGE]
+        n = len(heldout)
+        val_samples = heldout[:n//2]
+        test_samples = heldout[n//2:]
+        return train_samples, val_samples, test_samples
 
-# -------------------------------
-# Dataset split (unseen sentence split)
-# -------------------------------
-sentences = list({s["sentence"] for s in all_samples})
-random.shuffle(sentences)
-n = len(sentences)
-train_s = set(sentences[:int(TRAIN_RATIO*n)])
-val_s   = set(sentences[int(TRAIN_RATIO*n):int((TRAIN_RATIO+VAL_RATIO)*n)])
-test_s  = set(sentences[int((TRAIN_RATIO+VAL_RATIO)*n):])
+    sentences = list({s["sentence"] for s in samples})
+    random.shuffle(sentences)
+    n = len(sentences)
+    train_s = set(sentences[:int(TRAIN_RATIO * n)])
+    val_s   = set(sentences[int(TRAIN_RATIO * n):int((TRAIN_RATIO + VAL_RATIO) * n)])
+    test_s  = set(sentences[int((TRAIN_RATIO + VAL_RATIO) * n):])
+    train_samples = [s for s in samples if s["sentence"] in train_s]
+    val_samples   = [s for s in samples if s["sentence"] in val_s]
+    test_samples  = [s for s in samples if s["sentence"] in test_s]
+    return train_samples, val_samples, test_samples
 
-train_samples = [s for s in all_samples if s["sentence"] in train_s]
-val_samples   = [s for s in all_samples if s["sentence"] in val_s]
-test_samples  = [s for s in all_samples if s["sentence"] in test_s]
-
+train_samples, val_samples, test_samples = split_dataset(all_samples)
 print(f"Train: {len(train_samples)}, Val: {len(val_samples)}, Test: {len(test_samples)}")
 
-# -------------------------------
-# Curriculum logic for experts
-# -------------------------------
+# ------------------------------- Step 4: Expert datasets -------------------------------
 expert_datasets = {}
 for s in train_samples:
-    eid = LANG_TO_EXPERT.get(s["lang"].lower(), 0)
-    expert_datasets.setdefault(eid, []).append(s)
+    lang = s["lang"].lower()
+    eid = LANG_TO_EXPERT.get(lang)
+    if eid is not None:
+        expert_datasets.setdefault(eid, []).append(s)
 
-def sample_curriculum(epoch):
-    target = epoch % len(expert_datasets)
-    main = expert_datasets[target]
-    others = [s for eid, data in expert_datasets.items() if eid != target for s in data]
-    mix_n = int(len(main) * CURRICULUM_MIX_RATIO)
-    mix = random.sample(others, min(mix_n, len(others)))
-    data = main + mix
-    random.shuffle(data)
-    print(f"Curriculum expert {target}: {len(main)} + {len(mix)}")
-    return data
+def sample_curriculum_dataset(epoch, expert_datasets, mix_ratio=0.2):
+    target_expert = epoch % len(expert_datasets)
+    target_samples = expert_datasets[target_expert]
+    other_samples = [s for eid, data in expert_datasets.items() if eid != target_expert for s in data]
+    mix_size = int(len(target_samples) * mix_ratio)
+    mixed_samples = random.sample(other_samples, min(mix_size, len(other_samples)))
+    dataset = target_samples + mixed_samples
+    random.shuffle(dataset)
+    print(f"Curriculum epoch expert: {target_expert}, Samples: {len(dataset)}")
+    return dataset, target_expert
 
-# -------------------------------
-# Collate wrapper using universal cache
-# -------------------------------
-def safe_collate(batch):
-    return collate_batch(batch, embedding_cache, device=device)
+# ------------------------------- Step 5: Model -------------------------------
+max_fix_idx = max([max(s["scanpath"]) for s in all_samples])
+embedding_size = max_fix_idx + 1
 
-# -------------------------------
-# Training & evaluation
-# -------------------------------
-def train_epoch(model, samples, optimizer):
-    model.train()
-    total_loss = 0
-    steps = 0
-
-    for i in range(0, len(samples), BATCH_SIZE):
-        batch = samples[i:i+BATCH_SIZE]
-        collated = safe_collate(batch)
-        if collated is None:
-            continue
-
-        inputs, fix_inputs, fix_targets, dur_targets, full_word_embeddings, lengths, expert_ids = collated
-
-        optimizer.zero_grad()
-        logits, dur_pred = model(inputs, fix_inputs, full_word_embeddings, lengths, expert_ids)
-
-        loss_scan = F.cross_entropy(logits.view(-1, logits.size(-1)), fix_targets.view(-1), ignore_index=-1)
-        mask = fix_targets != -1
-        if not mask.any():
-            continue
-        loss_dur = F.mse_loss(dur_pred[mask], dur_targets[mask])
-        loss = ALPHA * loss_scan + (1 - ALPHA) * loss_dur
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-        steps += 1
-
-    return total_loss / max(steps, 1)
-
-def evaluate(model, samples):
-    model.eval()
-    total_loss = 0
-    steps = 0
-
-    with torch.no_grad():
-        for i in range(0, len(samples), BATCH_SIZE):
-            batch = samples[i:i+BATCH_SIZE]
-            collated = safe_collate(batch)
-            if collated is None:
-                continue
-
-            inputs, fix_inputs, fix_targets, dur_targets, full_word_embeddings, lengths, expert_ids = collated
-            logits, dur_pred = model(inputs, fix_inputs, full_word_embeddings, lengths, expert_ids)
-
-            loss_scan = F.cross_entropy(logits.view(-1, logits.size(-1)), fix_targets.view(-1), ignore_index=-1)
-            mask = fix_targets != -1
-            if not mask.any():
-                continue
-            loss_dur = F.mse_loss(dur_pred[mask], dur_targets[mask])
-            loss = ALPHA * loss_scan + (1 - ALPHA) * loss_dur
-            total_loss += loss.item()
-            steps += 1
-
-    return total_loss / max(steps, 1)
-
-# -------------------------------
-# Model & optimizer
-# -------------------------------
 model = EyeExpertM(
     hidden_dim=256,
     encoder_dim=768,
     n_experts=5,
-    max_seq_len=200,
+    max_seq_len=embedding_size,
     window_size=4,
     n_layers=2,
-    attention_type="dot",
-).to(device)
+    attention_type="dot"
+).to(DEVICE)
 
 optimizer = optim.Adam(model.parameters(), lr=3e-4)
 
-# -------------------------------
-# Training loop
-# -------------------------------
-os.makedirs("checkpoints", exist_ok=True)
+# ------------------------------- Step 6: Train / Evaluate -------------------------------
+def train_epoch(model, samples, optimizer, batch_size=BATCH_SIZE, alpha=ALPHA, device=DEVICE, expert_id=0, embedding_cache=None):
+    model.train()
+    total_loss = 0.0
+    n_batches = max(1, len(samples) // batch_size)
+    pbar = tqdm(range(0, len(samples), batch_size), desc="Training", unit="batch")
 
+    for i in pbar:
+        batch_samples = samples[i:i+batch_size]
+        batch = collate_batch(batch_samples, device=device, embedding_cache=embedding_cache)
+        if batch is None:
+            continue
+
+        inputs, fix_targets, dur_targets, full_word_embeddings, lengths, pad_idx = batch
+
+        optimizer.zero_grad()
+        logits, dur_pred = model(inputs, fix_targets, full_word_embeddings, lengths, expert_id)
+        loss_fix = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)), fix_targets.view(-1), ignore_index=pad_idx
+        )
+        loss_dur = torch.nn.functional.mse_loss(dur_pred.view(-1), dur_targets.view(-1))
+        loss = alpha * loss_fix + (1 - alpha) * loss_dur
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        pbar.set_postfix({"batch_loss": total_loss / ((i // batch_size) + 1)})
+
+    return total_loss / n_batches
+
+def evaluate(model, samples, batch_size=BATCH_SIZE, alpha=ALPHA, device=DEVICE, expert_id=0, embedding_cache=None, desc="Evaluating"):
+    model.eval()
+    total_loss = 0.0
+    n_batches = max(1, len(samples) // batch_size)
+    pbar = tqdm(range(0, len(samples), batch_size), desc=desc, unit="batch")
+    with torch.no_grad():
+        for i in pbar:
+            batch_samples = samples[i:i+batch_size]
+            batch = collate_batch(batch_samples, device=device, embedding_cache=embedding_cache)
+            if batch is None:
+                continue
+
+            inputs, fix_targets, dur_targets, full_word_embeddings, lengths, pad_idx = batch
+            logits, dur_pred = model(inputs, fix_targets, full_word_embeddings, lengths, expert_id)
+            loss_fix = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)), fix_targets.view(-1), ignore_index=pad_idx
+            )
+            loss_dur = torch.nn.functional.mse_loss(dur_pred.view(-1), dur_targets.view(-1))
+            loss = alpha * loss_fix + (1 - alpha) * loss_dur
+            total_loss += loss.item()
+            pbar.set_postfix({"batch_loss": total_loss / ((i // batch_size) + 1)})
+
+    return total_loss / n_batches
+
+# ------------------------------- Step 7: Training loop -------------------------------
 for epoch in range(EPOCHS):
     print(f"\n=== Epoch {epoch+1}/{EPOCHS} ===")
-    train_data = sample_curriculum(epoch) if USE_EXPERT_CURRICULUM else train_samples
-    train_loss = train_epoch(model, train_data, optimizer)
-    val_loss = evaluate(model, val_samples)
-    test_loss = evaluate(model, test_samples)
+    if USE_EXPERT_CURRICULUM:
+        epoch_dataset, epoch_expert = sample_curriculum_dataset(epoch, expert_datasets, CURRICULUM_MIX_RATIO)
+    else:
+        epoch_dataset, epoch_expert = train_samples, 0
+
+    train_loss = train_epoch(model, epoch_dataset, optimizer, expert_id=epoch_expert, embedding_cache=embedding_cache)
+    val_loss = evaluate(model, val_samples, expert_id=epoch_expert, embedding_cache=embedding_cache, desc="Validation")
+    test_loss = evaluate(model, test_samples, expert_id=epoch_expert, embedding_cache=embedding_cache, desc="Test")
     print(f"Train: {train_loss:.4f} | Val: {val_loss:.4f} | Test: {test_loss:.4f}")
+
     torch.save(model.state_dict(), f"checkpoints/eyeexpert_epoch{epoch+1}.pt")
+    print("✅ Saved checkpoint")
