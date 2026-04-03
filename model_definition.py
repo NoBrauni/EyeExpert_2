@@ -23,17 +23,12 @@ def collate_batch(samples, embedding_cache, device="cpu"):
     """
     Collates a batch of samples for EyeExpertM, injecting word embeddings from a separate cache.
 
-    Args:
-        samples (list[dict]): List of dataset samples (from .pkl files).
-        embedding_cache (dict): Mapping from normalized_sentence -> {"embeddings": Tensor, "words": list}.
-        device (str): "cpu" or "cuda"
-
     Returns:
         padded_inputs       : [B, T, hidden_dim] -> embeddings at fixations
         padded_fix          : [B, T] -> padded scanpath indices
         padded_durs         : [B, T] -> padded durations
         padded_full_emb     : [B, max_words, hidden_dim] -> full sentence embeddings
-        lengths             : list[int] -> lengths of each sequence
+        lengths_tensor      : [B] 1D CPU int64 tensor -> lengths of each sequence
         PAD_IDX             : int
     """
     batch_inputs = []
@@ -43,12 +38,8 @@ def collate_batch(samples, embedding_cache, device="cpu"):
     lengths = []
 
     for sample in samples:
-        # -------------------------------
-        # Look up word embeddings from cache
-        # -------------------------------
         norm_sent = normalize_sentence(sample["sentence"])
         if norm_sent not in embedding_cache:
-            # fallback: zeros
             word_embeddings = torch.zeros(len(sample["words"]), 768, device=device)
         else:
             word_embeddings = embedding_cache[norm_sent]["embeddings"].to(device)
@@ -56,15 +47,12 @@ def collate_batch(samples, embedding_cache, device="cpu"):
         fix_seq = sample["scanpath"]
         dur_seq = sample["durations"]
 
-        # Skip first fixation (no prediction target)
         if len(fix_seq) <= 1:
             continue
 
-        # Offset by +1 so PAD_IDX=0
         fix_indices = torch.tensor(fix_seq[1:], dtype=torch.long, device=device) + 1
         dur_values = torch.tensor(dur_seq[1:], dtype=torch.float, device=device)
 
-        # Mask out-of-bounds fixations
         num_words = word_embeddings.size(0)
         mask_valid = fix_indices < num_words
         fix_indices = fix_indices[mask_valid]
@@ -82,9 +70,7 @@ def collate_batch(samples, embedding_cache, device="cpu"):
     if not batch_inputs:
         return None
 
-    # -------------------------------
     # Pad sequences
-    # -------------------------------
     padded_inputs = pad_sequence(batch_inputs, batch_first=True, padding_value=0.0)
     padded_fix = pad_sequence(batch_fix, batch_first=True, padding_value=PAD_IDX)
     padded_durs = pad_sequence(batch_dur, batch_first=True, padding_value=0.0)
@@ -97,21 +83,26 @@ def collate_batch(samples, embedding_cache, device="cpu"):
         for e in batch_full_emb
     ], dim=0)
 
-    return padded_inputs, padded_fix, padded_durs, padded_full_emb, lengths, PAD_IDX
+    # Convert lengths to a 1D CPU int64 tensor (required by pack_padded_sequence)
+    lengths_tensor = torch.tensor(lengths, dtype=torch.long, device='cpu')
+
+    return padded_inputs, padded_fix, padded_durs, padded_full_emb, lengths_tensor, PAD_IDX
+
+
 # -------------------------------
 # EyeExpertM Model
 # -------------------------------
 class EyeExpertM(nn.Module):
     def __init__(
-        self,
-        hidden_dim=256,
-        encoder_dim=768,
-        n_experts=5,
-        max_seq_len=200,
-        n_layers=1,
-        dropout=0.1,
-        attention_type="dot",   # "dot", "additive", or None
-        window_size=8
+            self,
+            hidden_dim=256,
+            encoder_dim=768,
+            n_experts=5,
+            max_seq_len=200,
+            n_layers=1,
+            dropout=0.1,
+            attention_type="dot",  # "dot", "additive", or None
+            window_size=8
     ):
         super().__init__()
 
@@ -156,7 +147,6 @@ class EyeExpertM(nn.Module):
             self.attention = None
 
     def forward(self, inputs, fix_seq, full_word_embeddings, lengths, expert_id):
-
         # -------------------------------
         # Mask padding fixations
         # -------------------------------
@@ -167,7 +157,7 @@ class EyeExpertM(nn.Module):
         # GRU expert
         expert = self.experts[expert_id]
 
-        lengths_tensor = torch.tensor(lengths, dtype=torch.long, device=inputs.device)
+        lengths_tensor = lengths  # Already 1D CPU int64 tensor
 
         packed = pack_padded_sequence(
             rnn_inputs,
@@ -207,7 +197,6 @@ class EyeExpertM(nn.Module):
         distance = torch.abs(word_positions - cur_fix_expanded)
         saccade_mask = distance <= self.window_size
 
-        # Ignore padding fixations in mask
         saccade_mask = saccade_mask & (valid_mask.unsqueeze(-1))
         logits = logits.masked_fill(~saccade_mask, -1e9)
 

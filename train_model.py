@@ -13,8 +13,8 @@ DATA_DIR = "datasets"
 EMBEDDING_CACHE = "full_sentence_embeddings.pkl"
 
 TRAIN_RATIO = 0.7
-VAL_RATIO   = 0.15
-TEST_RATIO  = 0.15
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
 
 LEAVE_OUT_LANGUAGE = None
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -53,26 +53,28 @@ with open(EMBEDDING_CACHE, "rb") as f:
     embedding_cache = pickle.load(f)
 print(f"✅ Loaded embedding cache ({len(embedding_cache)})")
 
+
 # ------------------------------- Step 3: Dataset splitting -------------------------------
 def split_dataset(samples):
     if LEAVE_OUT_LANGUAGE:
         train_samples = [s for s in samples if s["lang"] != LEAVE_OUT_LANGUAGE]
         heldout = [s for s in samples if s["lang"] == LEAVE_OUT_LANGUAGE]
         n = len(heldout)
-        val_samples = heldout[:n//2]
-        test_samples = heldout[n//2:]
+        val_samples = heldout[:n // 2]
+        test_samples = heldout[n // 2:]
         return train_samples, val_samples, test_samples
 
     sentences = list({s["sentence"] for s in samples})
     random.shuffle(sentences)
     n = len(sentences)
     train_s = set(sentences[:int(TRAIN_RATIO * n)])
-    val_s   = set(sentences[int(TRAIN_RATIO * n):int((TRAIN_RATIO + VAL_RATIO) * n)])
-    test_s  = set(sentences[int((TRAIN_RATIO + VAL_RATIO) * n):])
+    val_s = set(sentences[int(TRAIN_RATIO * n):int((TRAIN_RATIO + VAL_RATIO) * n)])
+    test_s = set(sentences[int((TRAIN_RATIO + VAL_RATIO) * n):])
     train_samples = [s for s in samples if s["sentence"] in train_s]
-    val_samples   = [s for s in samples if s["sentence"] in val_s]
-    test_samples  = [s for s in samples if s["sentence"] in test_s]
+    val_samples = [s for s in samples if s["sentence"] in val_s]
+    test_samples = [s for s in samples if s["sentence"] in test_s]
     return train_samples, val_samples, test_samples
+
 
 train_samples, val_samples, test_samples = split_dataset(all_samples)
 print(f"Train: {len(train_samples)}, Val: {len(val_samples)}, Test: {len(test_samples)}")
@@ -85,6 +87,7 @@ for s in train_samples:
     if eid is not None:
         expert_datasets.setdefault(eid, []).append(s)
 
+
 def sample_curriculum_dataset(epoch, expert_datasets, mix_ratio=0.2):
     target_expert = epoch % len(expert_datasets)
     target_samples = expert_datasets[target_expert]
@@ -95,6 +98,7 @@ def sample_curriculum_dataset(epoch, expert_datasets, mix_ratio=0.2):
     random.shuffle(dataset)
     print(f"Curriculum epoch expert: {target_expert}, Samples: {len(dataset)}")
     return dataset, target_expert
+
 
 # ------------------------------- Step 5: Model -------------------------------
 max_fix_idx = max([max(s["scanpath"]) for s in all_samples])
@@ -112,15 +116,17 @@ model = EyeExpertM(
 
 optimizer = optim.Adam(model.parameters(), lr=3e-4)
 
+
 # ------------------------------- Step 6: Train / Evaluate -------------------------------
-def train_epoch(model, samples, optimizer, batch_size=BATCH_SIZE, alpha=ALPHA, device=DEVICE, expert_id=0, embedding_cache=None):
+def train_epoch(model, samples, optimizer, batch_size=BATCH_SIZE, alpha=ALPHA, device=DEVICE, expert_id=0,
+                embedding_cache=None):
     model.train()
     total_loss = 0.0
     n_batches = max(1, len(samples) // batch_size)
     pbar = tqdm(range(0, len(samples), batch_size), desc="Training", unit="batch")
 
     for i in pbar:
-        batch_samples = samples[i:i+batch_size]
+        batch_samples = samples[i:i + batch_size]
         batch = collate_batch(batch_samples, device=device, embedding_cache=embedding_cache)
         if batch is None:
             continue
@@ -129,6 +135,7 @@ def train_epoch(model, samples, optimizer, batch_size=BATCH_SIZE, alpha=ALPHA, d
 
         optimizer.zero_grad()
         logits, dur_pred = model(inputs, fix_targets, full_word_embeddings, lengths, expert_id)
+
         loss_fix = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)), fix_targets.view(-1), ignore_index=pad_idx
         )
@@ -136,25 +143,30 @@ def train_epoch(model, samples, optimizer, batch_size=BATCH_SIZE, alpha=ALPHA, d
         loss = alpha * loss_fix + (1 - alpha) * loss_dur
         loss.backward()
         optimizer.step()
+
         total_loss += loss.item()
         pbar.set_postfix({"batch_loss": total_loss / ((i // batch_size) + 1)})
 
     return total_loss / n_batches
 
-def evaluate(model, samples, batch_size=BATCH_SIZE, alpha=ALPHA, device=DEVICE, expert_id=0, embedding_cache=None, desc="Evaluating"):
+def evaluate(model, samples, batch_size=BATCH_SIZE, alpha=ALPHA, device=DEVICE, expert_id=0, embedding_cache=None,
+             desc="Evaluating"):
     model.eval()
     total_loss = 0.0
     n_batches = max(1, len(samples) // batch_size)
     pbar = tqdm(range(0, len(samples), batch_size), desc=desc, unit="batch")
+
     with torch.no_grad():
         for i in pbar:
-            batch_samples = samples[i:i+batch_size]
+            batch_samples = samples[i:i + batch_size]
             batch = collate_batch(batch_samples, device=device, embedding_cache=embedding_cache)
             if batch is None:
                 continue
 
             inputs, fix_targets, dur_targets, full_word_embeddings, lengths, pad_idx = batch
+
             logits, dur_pred = model(inputs, fix_targets, full_word_embeddings, lengths, expert_id)
+
             loss_fix = torch.nn.functional.cross_entropy(
                 logits.view(-1, logits.size(-1)), fix_targets.view(-1), ignore_index=pad_idx
             )
@@ -165,18 +177,45 @@ def evaluate(model, samples, batch_size=BATCH_SIZE, alpha=ALPHA, device=DEVICE, 
 
     return total_loss / n_batches
 
+
 # ------------------------------- Step 7: Training loop -------------------------------
 for epoch in range(EPOCHS):
-    print(f"\n=== Epoch {epoch+1}/{EPOCHS} ===")
+    print(f"\n=== Epoch {epoch + 1}/{EPOCHS} ===")
+
     if USE_EXPERT_CURRICULUM:
         epoch_dataset, epoch_expert = sample_curriculum_dataset(epoch, expert_datasets, CURRICULUM_MIX_RATIO)
     else:
         epoch_dataset, epoch_expert = train_samples, 0
 
-    train_loss = train_epoch(model, epoch_dataset, optimizer, expert_id=epoch_expert, embedding_cache=embedding_cache)
-    val_loss = evaluate(model, val_samples, expert_id=epoch_expert, embedding_cache=embedding_cache, desc="Validation")
-    test_loss = evaluate(model, test_samples, expert_id=epoch_expert, embedding_cache=embedding_cache, desc="Test")
+    # --- Train ---
+    train_loss = train_epoch(
+        model,
+        epoch_dataset,
+        optimizer,
+        expert_id=epoch_expert,
+        embedding_cache=embedding_cache
+    )
+
+    # --- Validate ---
+    val_loss = evaluate(
+        model,
+        val_samples,
+        expert_id=epoch_expert,
+        embedding_cache=embedding_cache,
+        desc="Validation"
+    )
+
+    # --- Test ---
+    test_loss = evaluate(
+        model,
+        test_samples,
+        expert_id=epoch_expert,
+        embedding_cache=embedding_cache,
+        desc="Test"
+    )
+
     print(f"Train: {train_loss:.4f} | Val: {val_loss:.4f} | Test: {test_loss:.4f}")
 
-    torch.save(model.state_dict(), f"checkpoints/eyeexpert_epoch{epoch+1}.pt")
+    # --- Save checkpoint ---
+    torch.save(model.state_dict(), f"checkpoints/eyeexpert_epoch{epoch + 1}.pt")
     print("✅ Saved checkpoint")
